@@ -1,8 +1,11 @@
+import logging
+import os
 import signal
 import sys
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
+from fastmcp.server.auth.providers.github import GitHubProvider
 
 from whatsapp import (
     download_media as whatsapp_download_media,
@@ -34,18 +37,70 @@ from whatsapp import (
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
 )
-from whatsapp import (
-    send_audio_message as whatsapp_audio_voice_message,
-)
-from whatsapp import (
-    send_file as whatsapp_send_file,
-)
-from whatsapp import (
-    send_message as whatsapp_send_message,
-)
 
-# Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+# NOTE (read-only deployment): send_message / send_file / send_audio_message are
+# intentionally NOT imported and NOT exposed as tools. The point is to eliminate
+# the outbound-send (exfiltration) vector entirely, not gate it. The Go bridge's
+# /api/send and /api/typing routes are also disabled (see whatsapp-bridge/main.go).
+
+logger = logging.getLogger("whatsapp-mcp")
+
+
+class _AllowlistGitHubProvider(GitHubProvider):
+    """GitHubProvider restricted to an explicit set of GitHub logins.
+
+    fastmcp v3's GitHubProvider has NO ``allowed_users`` parameter (it existed in
+    2.x). Without a gate, any GitHub account could complete OAuth against our app.
+    OAuthProxy validates the upstream GitHub token via its inner token verifier
+    both at code-exchange time AND on every request (see oauth_proxy/proxy.py).
+    We wrap that verifier so a login outside the allowlist fails validation and
+    never holds a usable session.
+    """
+
+    def __init__(self, *, allowed_users: list[str], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        allowed = {u.strip().lower() for u in allowed_users if u.strip()}
+        if not allowed:
+            raise ValueError("allowed_users must contain at least one GitHub login")
+        verifier = self._token_validator
+        inner_verify = verifier.verify_token
+
+        async def gated_verify(token: str):
+            access = await inner_verify(token)
+            if access is None:
+                return None
+            login = (access.claims or {}).get("login")
+            if not login or login.lower() not in allowed:
+                logger.warning("Denied non-allowlisted GitHub user: %r", login)
+                return None
+            return access
+
+        verifier.verify_token = gated_verify  # type: ignore[method-assign]
+
+
+def _build_auth() -> _AllowlistGitHubProvider:
+    try:
+        client_id = os.environ["GITHUB_CLIENT_ID"]
+        client_secret = os.environ["GITHUB_CLIENT_SECRET"]
+    except KeyError as missing:
+        raise SystemExit(
+            f"Missing required env var {missing}. Set GITHUB_CLIENT_ID and "
+            "GITHUB_CLIENT_SECRET from the GitHub OAuth app."
+        ) from None
+    allowed_users = [
+        u for u in os.environ.get("MCP_ALLOWED_USERS", "arnav1253").split(",") if u.strip()
+    ]
+    return _AllowlistGitHubProvider(
+        client_id=client_id,
+        client_secret=client_secret,
+        base_url=os.environ.get("MCP_BASE_URL", "https://whatsapp.arnavdev.com"),
+        required_scopes=["user:email"],
+        allowed_users=allowed_users,
+    )
+
+
+# Initialize FastMCP server (GitHub OAuth gated to the allowlist)
+mcp = FastMCP("whatsapp", auth=_build_auth())
 
 
 @mcp.tool()
@@ -287,59 +342,7 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> dic
     return context
 
 
-@mcp.tool()
-def send_message(recipient: str, message: str) -> dict[str, Any]:
-    """Send a WhatsApp message to a person or group. For group chats use the JID.
-
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        message: The message text to send
-
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    # Validate input
-    if not recipient:
-        return {"success": False, "message": "Recipient must be provided"}
-
-    # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(recipient, message)
-    return {"success": success, "message": status_message}
-
-
-@mcp.tool()
-def send_file(recipient: str, media_path: str) -> dict[str, Any]:
-    """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
-
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the media file to send (image, video, document)
-
-    Returns:
-        A dictionary containing success status and a status message
-    """
-
-    # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
-    return {"success": success, "message": status_message}
-
-
-@mcp.tool()
-def send_audio_message(recipient: str, media_path: str) -> dict[str, Any]:
-    """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
-
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
-
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
-    return {"success": success, "message": status_message}
+# send_message / send_file / send_audio_message removed for read-only deployment.
 
 
 @mcp.tool()
@@ -371,5 +374,10 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
-    # Initialize and run the server
-    mcp.run(transport="stdio")
+    # Initialize and run the server over Streamable HTTP (Caddy proxies to this).
+    # Endpoint is served at /mcp/ on the given host:port.
+    mcp.run(
+        transport="http",
+        host=os.environ.get("MCP_HOST", "127.0.0.1"),
+        port=int(os.environ.get("MCP_PORT", "8002")),
+    )

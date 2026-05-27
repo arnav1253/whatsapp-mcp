@@ -1801,8 +1801,13 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		_ = json.NewEncoder(w).Encode(status)
 	}))
 
-	// Handler for sending messages
+	// Handler for sending messages — DISABLED for read-only deployment.
+	// Outbound send is the exfiltration vector we deliberately eliminate.
+	// The original handler below is kept (unreachable) only to avoid churn.
 	mux.HandleFunc("/api/send", auth(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "send disabled: read-only deployment", http.StatusForbidden)
+		return
+
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1936,7 +1941,11 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 	}))
 
 	// Handler for sending typing indicator
+	// /api/typing DISABLED for read-only deployment (no outbound presence/signals).
 	mux.HandleFunc("/api/typing", auth(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "typing disabled: read-only deployment", http.StatusForbidden)
+		return
+
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
